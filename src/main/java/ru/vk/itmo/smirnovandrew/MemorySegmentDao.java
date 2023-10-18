@@ -4,27 +4,30 @@ import ru.vk.itmo.BaseEntry;
 import ru.vk.itmo.Config;
 import ru.vk.itmo.Dao;
 import ru.vk.itmo.Entry;
-import ru.vk.itmo.test.DaoFactory;
-import ru.vk.itmo.test.smirnovandrew.MyFactory;
 
-import java.io.BufferedReader;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.channels.FileChannel;
-import java.nio.file.*;
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
+import java.nio.file.Files;
+import java.nio.file.OpenOption;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.NavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 
 public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>> {
 
     private final Path tablePath;
 
-    private static final String table = "table.txt";
+    private static final String TABLE = "table.txt";
 
     private final MemorySegment ssTable;
+
+    private final Arena arena;
 
     private final NavigableMap<MemorySegment, Entry<MemorySegment>> segments =
             new ConcurrentSkipListMap<>(segmentComparator);
@@ -51,20 +54,14 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
     public MemorySegmentDao(Config config) {
         MemorySegment ssTable1;
 
-        tablePath = config.basePath().resolve(table);
-        try {
-            long fileSize = 0;
-            try {
-                fileSize = Files.size(tablePath);
-            } catch (IOException e) {
-                Files.createFile(tablePath);
-                System.err.println("Can't find table file " + e);
-            }
+        arena = Arena.ofShared();
 
+        tablePath = config.basePath().resolve(TABLE);
+        try {
+            long fileSize = Files.size(tablePath);
             ssTable1 = assertFile(tablePath, fileSize,
                     FileChannel.MapMode.READ_ONLY, StandardOpenOption.READ);
         } catch (IOException e) {
-            System.err.println("Table path is incorrect");
             ssTable1 = null;
         }
         ssTable = ssTable1;
@@ -73,13 +70,14 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
     public MemorySegmentDao() {
         tablePath = null;
         ssTable = null;
+        arena = null;
     }
 
-    private static MemorySegment assertFile(Path path, long fileSize,
-                                            FileChannel.MapMode mapMode, OpenOption... openOptions)
+    private MemorySegment assertFile(Path path, long fileSize,
+                                     FileChannel.MapMode mapMode, OpenOption... openOptions)
             throws IOException {
-        try (final var fc = FileChannel.open(path, openOptions)) {
-            return fc.map(mapMode, 0, fileSize, Arena.ofAuto());
+        try (var fc = FileChannel.open(path, openOptions)) {
+            return fc.map(mapMode, 0, fileSize, arena);
         }
     }
 
@@ -115,23 +113,23 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
         long offset = 0;
         while (offset < fileSize) {
             long keyLen = ssTable.get(ValueLayout.JAVA_LONG_UNALIGNED, offset);
-            final var currentKey = ssTable.asSlice(offset, keyLen);
-            offset += keyLen + Long.BYTES;
-
+            offset += Long.BYTES;
             long valueLen = ssTable.get(ValueLayout.JAVA_LONG_UNALIGNED, offset);
-            final var currentValue = valueLen != -1 ? ssTable.asSlice(offset, valueLen) : null;
-            offset += valueLen + Long.BYTES;
+            offset += Long.BYTES;
 
             if (keyLen != key.byteSize()) {
+                offset += keyLen + valueLen;
                 continue;
             }
 
-            if (segmentComparator.compare(currentKey, key) == 0) {
+            final var currentKey = ssTable.asSlice(offset, keyLen);
+            final var currentValue = valueLen == -1 ? null : ssTable.asSlice(offset + keyLen, valueLen);
+            offset += valueLen + keyLen;
+
+            if (key.mismatch(currentKey) == -1) {
                 return new BaseEntry<>(currentKey, currentValue);
             }
         }
-
-
         return null;
     }
 
@@ -151,15 +149,12 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
 
     private long writeSegment(MemorySegment segment, MemorySegment table, long offset) {
         if (segment == null) {
-            table.set(ValueLayout.JAVA_LONG_UNALIGNED, offset, -1);
-
-            return offset + Long.BYTES;
+            return offset;
         }
 
-        table.set(ValueLayout.JAVA_LONG_UNALIGNED, offset, segment.byteSize());
-        MemorySegment.copy(segment, 0, table, offset + Long.BYTES, segment.byteSize());
+        MemorySegment.copy(segment, 0, table, offset, segment.byteSize());
 
-        return offset + Long.BYTES + segment.byteSize();
+        return offset + segment.byteSize();
     }
 
     @Override
@@ -170,13 +165,21 @@ public class MemorySegmentDao implements Dao<MemorySegment, Entry<MemorySegment>
                 StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE,
                 StandardOpenOption.READ, StandardOpenOption.CREATE);
 
-        System.out.println(ssTableClose);
-
         long offset = 0;
         for (final var entry : segments.values()) {
+            ssTableClose.set(ValueLayout.JAVA_LONG_UNALIGNED, offset, entry.key().byteSize());
+            offset += Long.BYTES;
+            ssTableClose.set(ValueLayout.JAVA_LONG_UNALIGNED, offset, entry.value().byteSize());
+            offset += Long.BYTES;
+
             offset = writeSegment(entry.key(), ssTableClose, offset);
             offset = writeSegment(entry.value(), ssTableClose, offset);
         }
+
+        if (!arena.scope().isAlive()) {
+            return;
+        }
+        arena.close();
     }
 
 }
